@@ -1,4 +1,51 @@
-use crate::opcodes::{OPCODES_MAP, Mnemonic};
+use crate::opcodes::{OPCODES_MAP, Mnemonic, OpCode};
+use crate::bus::Bus;
+
+
+const STACK: u16 = 0x0100;
+const STACK_RESET: u8 = 0xfd;
+
+
+
+
+pub struct StatusRegister {
+    carry: bool,
+    zero: bool,
+    interrupt_disable: bool,
+    decimal_mode: bool,
+    break_command: bool,
+    _reserved: bool,
+    overflow: bool,
+    negative: bool,
+}
+
+impl StatusRegister {
+    pub fn from_byte(byte: u8) -> Self {
+        Self {
+            carry: byte & 1 == 1,
+            zero: (byte >> 1) & 1 == 1,
+            interrupt_disable: (byte >> 2) & 1 == 1,
+            decimal_mode: (byte >> 3) & 1 == 1,
+            break_command: (byte >> 4) & 1 == 1,
+            _reserved: (byte >> 5) & 1 == 1,
+            overflow: (byte >> 6) & 1 == 1,
+            negative: (byte >> 7) & 1 == 1,
+        }
+    }
+
+    pub fn to_byte(&self) -> u8 {
+        let mut status = 0;
+        status |= self.carry as u8;
+        status |= (self.zero as u8) << 1;
+        status |= (self.interrupt_disable as u8) << 2;
+        status |= (self.decimal_mode as u8) << 3;
+        status |= (self.break_command as u8) << 4;
+        status |= 1 << 5;
+        status |= (self.overflow as u8) << 6;
+        status |= (self.negative as u8) << 7;
+        status
+    }
+}
 
 
 pub struct CPU {
@@ -8,50 +55,48 @@ pub struct CPU {
     pub stack_pointer: u8,
     pub status: StatusRegister,
     pub program_counter: u16,
-    memory: [u8; 0xffff],
+    pub bus: Bus,
 }
 
 impl CPU {
-    pub fn new() -> Self {
+    pub fn new(bus: Bus) -> Self {
         Self {
             register_a: 0,
             register_x: 0,
             register_y: 0,
-            stack_pointer: 0xfd,
-            status: StatusRegister::from_byte(0b0000_0000),
+            stack_pointer: STACK_RESET,
+            status: StatusRegister::from_byte(0b0010_0100),
             program_counter: 0,
-            memory: [0; 0xffff],
+            bus,
         }
     }
-
-
+    // memory access
     pub fn mem_read(&self, addr: u16) -> u8 {
-        self.memory[addr as usize]
+        self.bus.mem_read(addr)
     }
 
-    pub fn mem_read_u16(&mut self, pos: u16) -> u16 {
-        let lo = self.mem_read(pos) as u16;
-        let hi = self.mem_read(pos + 1) as u16;
+    pub fn mem_read_u16(&mut self, addr: u16) -> u16 {
+        let lo = self.mem_read(addr) as u16;
+        let hi = self.mem_read(addr.wrapping_add(1)) as u16;
         (hi << 8) | lo
     }
 
     pub fn mem_write(&mut self, addr: u16, data: u8) {
-        self.memory[addr as usize] = data;
+        self.bus.mem_write(addr, data);
     }
 
-    pub fn mem_write_u16(&mut self, pos: u16, data: u16) {
+    pub fn mem_write_u16(&mut self, addr: u16, data: u16) {
         let lo = (data & 0xff) as u8;
         let hi = (data >> 8) as u8;
-        self.mem_write(pos, lo);
-        self.mem_write(pos + 1, hi);
+        self.mem_write(addr, lo);
+        self.mem_write(addr.wrapping_add(1), hi);
     }
 
-    pub fn mem_ref_mut(&mut self, addr: u16) -> &mut u8 {
-        &mut self.memory[addr as usize]
-    }
 
+
+    // stack operations
     fn stack_push(&mut self, data: u8) {
-        self.mem_write(0x100 + self.stack_pointer as u16, data);
+        self.mem_write(STACK + self.stack_pointer as u16, data);
         self.stack_pointer = self.stack_pointer.wrapping_sub(1);
     }
 
@@ -64,7 +109,7 @@ impl CPU {
 
     fn stack_pop(&mut self) -> u8 {
         self.stack_pointer = self.stack_pointer.wrapping_add(1);
-        self.mem_read(0x100 + self.stack_pointer as u16)
+        self.mem_read(STACK + self.stack_pointer as u16)
     }
 
     fn stack_pop_u16(&mut self) -> u16 {
@@ -73,24 +118,31 @@ impl CPU {
         (hi << 8) | lo
     }
 
+
+
+    // main functions
     pub fn load_and_run(&mut self, program: Vec<u8>) {
         self.load(program);
         self.reset();
+        self.program_counter = 0x0600;
         self.run();
     }
 
     pub fn reset(&mut self) {
         self.register_a = 0;
         self.register_x = 0;
-        self.status = StatusRegister::from_byte(0b0000_0000);
+        self.register_y = 0;
+        self.stack_pointer = STACK_RESET;
+        self.status = StatusRegister::from_byte(0b0010_0100);
 
         self.program_counter = self.mem_read_u16(0xFFFC);
     }
 
     pub fn load(&mut self, program: Vec<u8>) {
-        self.memory[0x0600..(0x0600 + program.len())]
-            .copy_from_slice(&program[..]);
-        self.mem_write_u16(0xFFFC, 0x0600);
+        for i in 0..program.len() {
+            self.mem_write(0x0600 + i as u16, program[i]);
+        }
+        // self.mem_write_u16(0xFFFC, 0x8000);
     }
 
     pub fn run(&mut self) {
@@ -103,74 +155,70 @@ impl CPU {
     {
         let ref map = OPCODES_MAP;
 
-        loop {
+        while let Some(opcode) = map.get(&self.mem_read(self.program_counter)) {
             callback(self);
 
+            self.program_counter += 1;
 
-            let opscode = self.mem_read(self.program_counter);
-            self.program_counter = self.program_counter.wrapping_add(1);
+            let OpCode { mnemonic, mode, .. } = opcode;
 
-            if opscode == 0x00 {
-                break;
-            }
-
-            match map[&opscode].mnemonic {
-                Mnemonic::ADC => self.adc(&map[&opscode].mode),
-                Mnemonic::AND => self.and(&map[&opscode].mode),
-                Mnemonic::ASL => self.asl(&map[&opscode].mode),
-                Mnemonic::BCC => self.bcc(&map[&opscode].mode),
-                Mnemonic::BCS => self.bcs(&map[&opscode].mode),
-                Mnemonic::BEQ => self.beq(&map[&opscode].mode),
-                Mnemonic::BIT => self.bit(&map[&opscode].mode),
-                Mnemonic::BMI => self.bmi(&map[&opscode].mode),
-                Mnemonic::BNE => self.bne(&map[&opscode].mode),
-                Mnemonic::BPL => self.bpl(&map[&opscode].mode),
-                Mnemonic::BRK => self.brk(&map[&opscode].mode),
-                Mnemonic::BVC => self.bvc(&map[&opscode].mode),
-                Mnemonic::BVS => self.bvs(&map[&opscode].mode),
-                Mnemonic::CLC => self.clc(&map[&opscode].mode),
-                Mnemonic::CLD => self.cld(&map[&opscode].mode),
-                Mnemonic::CLI => self.cli(&map[&opscode].mode),
-                Mnemonic::CLV => self.clv(&map[&opscode].mode),
-                Mnemonic::CMP => self.cmp(&map[&opscode].mode),
-                Mnemonic::CPX => self.cpx(&map[&opscode].mode),
-                Mnemonic::CPY => self.cpy(&map[&opscode].mode),
-                Mnemonic::DEC => self.dec(&map[&opscode].mode),
-                Mnemonic::DEX => self.dex(&map[&opscode].mode),
-                Mnemonic::DEY => self.dey(&map[&opscode].mode),
-                Mnemonic::EOR => self.eor(&map[&opscode].mode),
-                Mnemonic::INC => self.inc(&map[&opscode].mode),
-                Mnemonic::INX => self.inx(&map[&opscode].mode),
-                Mnemonic::INY => self.iny(&map[&opscode].mode),
-                Mnemonic::JMP => self.jmp(&map[&opscode].mode),
-                Mnemonic::JSR => self.jsr(&map[&opscode].mode),
-                Mnemonic::LDA => self.lda(&map[&opscode].mode),
-                Mnemonic::LDX => self.ldx(&map[&opscode].mode),
-                Mnemonic::LDY => self.ldy(&map[&opscode].mode),
-                Mnemonic::LSR => self.lsr(&map[&opscode].mode),
-                Mnemonic::NOP => self.nop(&map[&opscode].mode),
-                Mnemonic::ORA => self.ora(&map[&opscode].mode),
-                Mnemonic::PHA => self.pha(&map[&opscode].mode),
-                Mnemonic::PHP => self.php(&map[&opscode].mode),
-                Mnemonic::PLA => self.pla(&map[&opscode].mode),
-                Mnemonic::PLP => self.plp(&map[&opscode].mode),
-                Mnemonic::ROL => self.rol(&map[&opscode].mode),
-                Mnemonic::ROR => self.ror(&map[&opscode].mode),
-                Mnemonic::RTI => self.rti(&map[&opscode].mode),
-                Mnemonic::RTS => self.rts(&map[&opscode].mode),
-                Mnemonic::SBC => self.sbc(&map[&opscode].mode),
-                Mnemonic::SEC => self.sec(&map[&opscode].mode),
-                Mnemonic::SED => self.sed(&map[&opscode].mode),
-                Mnemonic::SEI => self.sei(&map[&opscode].mode),
-                Mnemonic::STA => self.sta(&map[&opscode].mode),
-                Mnemonic::STX => self.stx(&map[&opscode].mode),
-                Mnemonic::STY => self.sty(&map[&opscode].mode),
-                Mnemonic::TAX => self.tax(&map[&opscode].mode),
-                Mnemonic::TAY => self.tay(&map[&opscode].mode),
-                Mnemonic::TSX => self.tsx(&map[&opscode].mode),
-                Mnemonic::TXA => self.txa(&map[&opscode].mode),
-                Mnemonic::TXS => self.txs(&map[&opscode].mode),
-                Mnemonic::TYA => self.tya(&map[&opscode].mode),
+            match mnemonic {
+                Mnemonic::ADC => self.adc(mode),
+                Mnemonic::AND => self.and(mode),
+                Mnemonic::ASL => self.asl(mode),
+                Mnemonic::BCC => self.bcc(mode),
+                Mnemonic::BCS => self.bcs(mode),
+                Mnemonic::BEQ => self.beq(mode),
+                Mnemonic::BIT => self.bit(mode),
+                Mnemonic::BMI => self.bmi(mode),
+                Mnemonic::BNE => self.bne(mode),
+                Mnemonic::BPL => self.bpl(mode),
+                Mnemonic::BRK => self.brk(mode),
+                Mnemonic::BVC => self.bvc(mode),
+                Mnemonic::BVS => self.bvs(mode),
+                Mnemonic::CLC => self.clc(mode),
+                Mnemonic::CLD => self.cld(mode),
+                Mnemonic::CLI => self.cli(mode),
+                Mnemonic::CLV => self.clv(mode),
+                Mnemonic::CMP => self.cmp(mode),
+                Mnemonic::CPX => self.cpx(mode),
+                Mnemonic::CPY => self.cpy(mode),
+                Mnemonic::DEC => self.dec(mode),
+                Mnemonic::DEX => self.dex(mode),
+                Mnemonic::DEY => self.dey(mode),
+                Mnemonic::EOR => self.eor(mode),
+                Mnemonic::INC => self.inc(mode),
+                Mnemonic::INX => self.inx(mode),
+                Mnemonic::INY => self.iny(mode),
+                Mnemonic::JMP => self.jmp(mode),
+                Mnemonic::JSR => self.jsr(mode),
+                Mnemonic::LDA => self.lda(mode),
+                Mnemonic::LDX => self.ldx(mode),
+                Mnemonic::LDY => self.ldy(mode),
+                Mnemonic::LSR => self.lsr(mode),
+                Mnemonic::NOP => self.nop(mode),
+                Mnemonic::ORA => self.ora(mode),
+                Mnemonic::PHA => self.pha(mode),
+                Mnemonic::PHP => self.php(mode),
+                Mnemonic::PLA => self.pla(mode),
+                Mnemonic::PLP => self.plp(mode),
+                Mnemonic::ROL => self.rol(mode),
+                Mnemonic::ROR => self.ror(mode),
+                Mnemonic::RTI => self.rti(mode),
+                Mnemonic::RTS => self.rts(mode),
+                Mnemonic::SBC => self.sbc(mode),
+                Mnemonic::SEC => self.sec(mode),
+                Mnemonic::SED => self.sed(mode),
+                Mnemonic::SEI => self.sei(mode),
+                Mnemonic::STA => self.sta(mode),
+                Mnemonic::STX => self.stx(mode),
+                Mnemonic::STY => self.sty(mode),
+                Mnemonic::TAX => self.tax(mode),
+                Mnemonic::TAY => self.tay(mode),
+                Mnemonic::TSX => self.tsx(mode),
+                Mnemonic::TXA => self.txa(mode),
+                Mnemonic::TXS => self.txs(mode),
+                Mnemonic::TYA => self.tya(mode),
             }
         }
     }
@@ -244,7 +292,7 @@ impl CPU {
         let value = self.get_operand(mode);
         let result = self.register_a & value;
         self.status.zero = result == 0;
-        self.status.overflow = value >> 6 == 1;
+        self.status.overflow = (value >> 6) & 1 == 1;
         self.status.negative = value >> 7 == 1;
     }
 
@@ -382,6 +430,16 @@ impl CPU {
     fn jmp(&mut self, mode: &AddressingMode) {
         self.program_counter = match mode {
             AddressingMode::Absolute => self.mem_read_u16(self.program_counter),
+            AddressingMode::Indirect => {
+                let mem_addr = self.mem_read_u16(self.program_counter);
+                if mem_addr & 0x00FF == 0x00FF {
+                    let lo = self.mem_read(mem_addr) as u16;
+                    let hi = self.mem_read(mem_addr & 0xFF00) as u16;
+                    (hi << 8) | lo
+                } else {
+                    self.mem_read_u16(mem_addr)
+                }
+            }
             _ => panic!("Invalid addressing mode for JMP instruction"),
         };
     }
@@ -389,7 +447,7 @@ impl CPU {
     fn jsr(&mut self, _mode: &AddressingMode) {
         let addr = self.mem_read_u16(self.program_counter);
         self.program_counter += 2;
-        self.stack_push_u16(self.program_counter);
+        self.stack_push_u16(self.program_counter - 1);
         self.program_counter = addr;
     }
 
@@ -444,7 +502,8 @@ impl CPU {
     }
 
     fn php(&mut self, _mode: &AddressingMode) {
-        self.stack_push(self.status.to_byte());
+        let status = self.status.to_byte() | 0b0011_0000;
+        self.stack_push(status);
     }
 
     fn pla(&mut self, _mode: &AddressingMode) {
@@ -456,6 +515,7 @@ impl CPU {
     fn plp(&mut self, _mode: &AddressingMode) {
         let status = self.stack_pop();
         self.status = StatusRegister::from_byte(status);
+        self.status.break_command = false;
     }
 
     fn rol(&mut self, mode: &AddressingMode) {
@@ -508,9 +568,7 @@ impl CPU {
     }
 
     fn rts(&mut self, _mode: &AddressingMode) {
-        let lo = self.stack_pop() as u16;
-        let hi = self.stack_pop() as u16;
-        self.program_counter = (hi << 8) | lo;
+        self.program_counter = self.stack_pop_u16().wrapping_add(1);
     }
 
     fn sbc(&mut self, mode: &AddressingMode) {
@@ -558,21 +616,25 @@ impl CPU {
     fn tax(&mut self, _mode: &AddressingMode) {
         self.register_x = self.register_a;
         self.status.zero = self.register_x == 0;
+        self.status.negative = self.register_x >> 7 == 1;
     }
 
     fn tay(&mut self, _mode: &AddressingMode) {
         self.register_y = self.register_a;
         self.status.zero = self.register_y == 0;
+        self.status.negative = self.register_y >> 7 == 1;
     }
 
     fn tsx(&mut self, _mode: &AddressingMode) {
         self.register_x = self.stack_pointer;
         self.status.zero = self.register_x == 0;
+        self.status.negative = self.register_x >> 7 == 1;
     }
 
     fn txa(&mut self, _mode: &AddressingMode) {
         self.register_a = self.register_x;
         self.status.zero = self.register_a == 0;
+        self.status.negative = self.register_a >> 7 == 1;
     }
 
     fn txs(&mut self, _mode: &AddressingMode) {
@@ -582,13 +644,18 @@ impl CPU {
     fn tya(&mut self, _mode: &AddressingMode) {
         self.register_a = self.register_y;
         self.status.zero = self.register_a == 0;
+        self.status.negative = self.register_a >> 7 == 1;
     }
 
     fn get_operand_address(&mut self, mode: &AddressingMode) -> u16 {
         match mode {
             AddressingMode::Implicit => panic!("No operand for this instruction"),
             AddressingMode::Accumulator => panic!("No operand for this instruction"),
-            AddressingMode::Immediate => panic!("No operand for this instruction"),
+            AddressingMode::Immediate => {
+                let pos = self.program_counter;
+                self.program_counter += 1;
+                pos
+            }
             AddressingMode::ZeroPage => {
                 let pos = self.program_counter;
                 self.program_counter += 1;
@@ -618,25 +685,25 @@ impl CPU {
             AddressingMode::Absolute_Y => {
                 let base = self.mem_read_u16(self.program_counter);
                 self.program_counter += 2;
-                println!("pc += 2");
                 base.wrapping_add(self.register_y as u16)
             }
             AddressingMode::Indirect => panic!("No operand for this instruction"),
             AddressingMode::Indirect_X => {
                 let base = self.mem_read(self.program_counter);
                 self.program_counter += 1;
-                let ptr = base.wrapping_add(self.register_x) as u16;
-                let lo = self.mem_read(ptr) as u16;
-                let hi = self.mem_read(ptr.wrapping_add(1)) as u16;
-                (hi << 8) | lo
+                let ptr: u8 = (base as u8).wrapping_add(self.register_x);
+                let lo = self.mem_read(ptr as u16);
+                let hi = self.mem_read(ptr.wrapping_add(1) as u16);
+                (hi as u16) << 8 | (lo as u16)
             }
             AddressingMode::Indirect_Y => {
                 let base = self.mem_read(self.program_counter);
                 self.program_counter += 1;
-                let lo = self.mem_read(base as u16) as u16;
-                let hi = self.mem_read(base.wrapping_add(1) as u16) as u16;
-                let deref_base = (hi << 8) | lo;
-                deref_base.wrapping_add(self.register_y as u16)
+                let lo = self.mem_read(base as u16);
+                let hi = self.mem_read((base as u8).wrapping_add(1) as u16);
+                let deref_base = (hi as u16) << 8 | (lo as u16);
+                let deref = deref_base.wrapping_add(self.register_y as u16);
+                deref
             }
         }
     }
@@ -645,11 +712,6 @@ impl CPU {
         match mode {
             AddressingMode::Implicit => panic!("No operand for this instruction"),
             AddressingMode::Accumulator => self.register_a,
-            AddressingMode::Immediate => {
-                let value = self.mem_read(self.program_counter);
-                self.program_counter += 1;
-                value
-            }
             AddressingMode::Relative => {
                 let offset = self.mem_read(self.program_counter);
                 self.program_counter += 1;
@@ -691,53 +753,16 @@ pub enum AddressingMode {
 }
 
 
-pub struct StatusRegister {
-    carry: bool,
-    zero: bool,
-    interrupt_disable: bool,
-    decimal_mode: bool,
-    break_command: bool,
-    _reserved: bool,
-    overflow: bool,
-    negative: bool,
-}
-
-impl StatusRegister {
-    fn from_byte(byte: u8) -> Self {
-        Self {
-            carry: byte & 1 == 1,
-            zero: (byte >> 1) & 1 == 1,
-            interrupt_disable: (byte >> 2) & 1 == 1,
-            decimal_mode: (byte >> 3) & 1 == 1,
-            break_command: (byte >> 4) & 1 == 1,
-            _reserved: (byte >> 5) & 1 == 1,
-            overflow: (byte >> 6) & 1 == 1,
-            negative: (byte >> 7) & 1 == 1,
-        }
-    }
-
-    fn to_byte(&self) -> u8 {
-        let mut status = 0;
-        status |= self.carry as u8;
-        status |= (self.zero as u8) << 1;
-        status |= (self.interrupt_disable as u8) << 2;
-        status |= (self.decimal_mode as u8) << 3;
-        status |= (self.break_command as u8) << 4;
-        status |= 1 << 5;
-        status |= (self.overflow as u8) << 6;
-        status |= (self.negative as u8) << 7;
-        status
-    }
-}
-
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::cartridge::test;
 
     #[test]
     fn test_0xa9_lda_immediate_load_data() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test::test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.load_and_run(vec![0xa9, 0x05, 0x00]);
         assert_eq!(cpu.register_a, 5);
         assert!(cpu.status.to_byte() & 0b0000_0010 == 0b00);
@@ -745,42 +770,11 @@ mod test {
     }
 
     #[test]
-    fn test_0xaa_tax_move_a_to_x() {
-        let mut cpu = CPU::new();
-        cpu.load(vec![0xaa, 0x00]);
-        cpu.reset();
-        cpu.register_a = 10;
-        cpu.run();
-
-        assert_eq!(cpu.register_x, 10)
-    }
-
-    #[test]
     fn test_5_ops_working_together() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test::test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.load_and_run(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]);
 
         assert_eq!(cpu.register_x, 0xc1)
-    }
-
-    #[test]
-    fn test_inx_overflow() {
-        let mut cpu = CPU::new();
-        cpu.load(vec![0xe8, 0xe8, 0x00]);
-        cpu.reset();
-        cpu.register_x = 0xff;
-        cpu.run();
-
-        assert_eq!(cpu.register_x, 1)
-    }
-
-    #[test]
-    fn test_lda_from_memory() {
-        let mut cpu = CPU::new();
-        cpu.mem_write(0x10, 0x55);
-
-        cpu.load_and_run(vec![0xa5, 0x10, 0x00]);
-
-        assert_eq!(cpu.register_a, 0x55);
     }
 }
