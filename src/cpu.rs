@@ -119,7 +119,6 @@ impl CPU {
     }
 
 
-
     // main functions
     pub fn load_and_run(&mut self, program: Vec<u8>) {
         self.load(program);
@@ -219,11 +218,11 @@ impl CPU {
                 Mnemonic::TXA => self.txa(mode),
                 Mnemonic::TXS => self.txs(mode),
                 Mnemonic::TYA => self.tya(mode),
+                _ => panic!("Unimplemented opcode: {:?}", mnemonic),
             }
         }
     }
-
-
+    
 
     // Instructions
     fn adc(&mut self, mode: &AddressingMode) {
@@ -488,7 +487,14 @@ impl CPU {
         }
     }
 
-    fn nop(&mut self, _mode: &AddressingMode) {}
+    fn nop(&mut self, mode: &AddressingMode) {
+        match mode {
+            AddressingMode::Implicit => {}
+            _ => {
+                let _ = self.get_operand(mode);
+            }
+        }
+    }
 
     fn ora(&mut self, mode: &AddressingMode) {
         let value = self.get_operand(mode);
